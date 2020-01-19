@@ -8,12 +8,16 @@ from uuid import uuid4
 import redis
 
 
-DB_VERSION = '1'
+DB_VERSION = '2'
 
 DATETIME_FORMAT = '%Y-%m-%d %H:%M:%S UTC'
 
 
 class DbVersionMismatch(Exception):
+    pass
+
+
+class NotOwned(Exception):
     pass
 
 
@@ -74,6 +78,9 @@ class Client:
             pipe.multi()
             pipe.lpop(f'queue:{name}')
             pipe.rpush(
+                f'lock:{name}', self.ident
+            )
+            pipe.rpush(
                 f'lock:{name}', datetime.utcnow().strftime(DATETIME_FORMAT)
             )
             pipe.rpush(
@@ -89,6 +96,22 @@ class Client:
             raise DbVersionMismatch
         return False
 
+    def unlock(self, name):
+        with self.redis_client.pipeline() as pipe:
+            pipe.watch(f'lock:{name}', 'db-version')
+
+            if pipe.get('db-version') != DB_VERSION:
+                raise DbVersionMismatch
+            if pipe.lindex(f'lock:{name}', 0) != self.ident:
+                raise NotOwned
+
+            pipe.multi()
+            pipe.delete(f'lock:{name}')
+            pipe.execute(raise_on_error=True)
+        next_ident = self.redis_client.lindex(f'queue:{name}', 0)
+        if next_ident is not None:
+            self.redis_client.publish(f'next:{name}', next_ident)
+
 
 if __name__ == '__main__':
     c = Client(redis.Redis(decode_responses=True))
@@ -96,3 +119,4 @@ if __name__ == '__main__':
     c.add_to_queue('hi')
     while not c.try_lock_slow('hi', 'just chilling', timeout_sec=5):
         print("trying again")
+    c.unlock('hi')
